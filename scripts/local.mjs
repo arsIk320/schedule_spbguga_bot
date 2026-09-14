@@ -9,8 +9,9 @@ function validateEnvironment() {
   if (!TOKEN_PATTERN.test(process.env.BOT_TOKEN ?? '')) {
     throw new Error('Укажите BOT_TOKEN из BotFather в файле .env.');
   }
-  if (!/^\d+$/.test(process.env.OWNER_ID ?? '') || !Number.isSafeInteger(Number(process.env.OWNER_ID))) {
-    throw new Error('Укажите числовой OWNER_ID в .env. Для первого запуска можно указать 0.');
+  const ownerId = process.env.OWNER_ID || '0';
+  if (!/^\d+$/.test(ownerId) || !Number.isSafeInteger(Number(ownerId))) {
+    throw new Error('OWNER_ID должен быть числом или отсутствовать (для многопользовательского режима используется 0).');
   }
   const timezone = process.env.DEFAULT_TIMEZONE || 'Europe/Moscow';
   try {
@@ -18,7 +19,7 @@ function validateEnvironment() {
   } catch {
     throw new Error('DEFAULT_TIMEZONE должен быть часовым поясом, например Europe/Moscow.');
   }
-  return { BOT_TOKEN: process.env.BOT_TOKEN, OWNER_ID: process.env.OWNER_ID, DEFAULT_TIMEZONE: timezone };
+  return { BOT_TOKEN: process.env.BOT_TOKEN, OWNER_ID: ownerId, DEFAULT_TIMEZONE: timezone };
 }
 
 class TelegramError extends Error {
@@ -122,7 +123,7 @@ async function main() {
     tick();
     interval = setInterval(tick, 30_000);
     console.log('Бот запущен. Напишите ему /start. Для остановки нажмите Ctrl+C.');
-    if (env.OWNER_ID === '0') console.log('Первичная настройка: отправьте боту /id, затем запишите свой ID в .env и перезапустите бота.');
+    console.log('Каждый пользователь работает со своим расписанием. Отправьте боту /start в личном чате.');
 
     let offset = 0;
     while (!shutdown.signal.aborted) {

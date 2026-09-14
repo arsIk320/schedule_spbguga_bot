@@ -51,7 +51,9 @@ async function fixture(t, { databasePath = ':memory:', initialize = true } = {})
     setHandler(value) { handler = value; },
     clearCalls() { calls.length = 0; },
     messages() { return calls.filter(call => call.method === 'sendMessage'); },
-    settings() { return env.DB.prepare('SELECT * FROM settings WHERE id = 1').first(); },
+    settings(chatId = OWNER) {
+      return env.DB.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(String(chatId)).first();
+    },
   };
 }
 
@@ -60,18 +62,20 @@ async function importSchedule(f, text = SCHEDULE, updateId = 1) {
   f.clearCalls();
 }
 
-test('только владелец в личном чате меняет расписание; чужие /id не заполняют БД', async t => {
+test('каждый пользователь получает отдельное расписание; групповые чаты игнорируются', async t => {
   const f = await fixture(t);
   await handleUpdate(update(1, SCHEDULE, 777), f.env);
   await handleUpdate(update(2, '/pause', 777), f.env);
-  await handleUpdate(update(3, SCHEDULE, OWNER, { chat: { id: OWNER, type: 'group' } }), f.env);
-  assert.equal(f.messages().length, 0);
-  assert.equal((await f.env.DB.prepare('SELECT COUNT(*) AS count FROM jobs').first()).count, 0);
+  await handleUpdate(update(3, SCHEDULE, OWNER, { chat: { id: -100, type: 'group' } }), f.env);
+  assert.equal(f.messages().length, 2);
+  assert.equal((await f.env.DB.prepare('SELECT COUNT(*) AS count FROM jobs').first()).count, 2);
+  assert.equal(JSON.parse((await f.settings(777)).schedule)[0].subject, 'Математика');
+  assert.equal((await f.settings(777)).paused, 1);
   assert.equal(await f.settings(), null);
   await handleUpdate(update(4, '/id', 777), f.env);
-  assert.equal(f.messages().length, 1);
-  assert.match(f.messages()[0].payload.text, /Telegram ID: 777/);
-  assert.equal((await f.env.DB.prepare('SELECT COUNT(*) AS count FROM jobs').first()).count, 0);
+  assert.equal(f.messages().length, 3);
+  assert.match(f.messages().at(-1).payload.text, /Telegram ID: 777/);
+  assert.equal((await f.env.DB.prepare('SELECT COUNT(*) AS count FROM jobs').first()).count, 3);
   await handleUpdate(update(5, '/start'), f.env);
   assert.equal((await f.settings()).timezone, 'Europe/Moscow');
 });
@@ -237,6 +241,17 @@ test('названия и расположение передаются прос
   assert.match(payload.text, /Иванов_И/);
 });
 
+test('напоминания доставляются каждому пользователю в его личный чат', async t => {
+  const f = await fixture(t);
+  await handleUpdate(update(1, SCHEDULE, OWNER), f.env);
+  await handleUpdate(update(2, SCHEDULE, 777), f.env);
+  f.clearCalls();
+  await runReminders(f.env, DUE);
+  const chatIds = f.messages().map(call => String(call.payload.chat_id)).sort();
+  assert.deepEqual(chatIds, ['12345', '777']);
+  assert.equal((await f.env.DB.prepare("SELECT COUNT(*) AS count FROM jobs WHERE key LIKE 'reminder:%' AND done = 1").first()).count, 2);
+});
+
 test('импорт .txt читает UTF-8; неверная кодировка и слишком большой файл сохраняют старые данные', async t => {
   const f = await fixture(t);
   const document = { file_id: 'fake-file-id', file_name: 'schedule.txt', file_size: 200 };
@@ -270,6 +285,8 @@ test('setup защищён секретом, создаёт схему и рег
   const connected = await worker.fetch(setup(f.env.WEBHOOK_SECRET), f.env);
   assert.equal(connected.status, 200);
   assert.match((await connected.json()).message, /Telegram подключён/);
+  assert.equal((await f.env.DB.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'user_settings'").first()).count, 1);
+  await handleUpdate(update(1, '/start'), f.env);
   assert.equal((await f.settings()).timezone, 'Europe/Moscow');
   const webhook = f.calls.find(call => call.method === 'setWebhook').payload;
   assert.equal(webhook.url, 'https://bot.example/telegram');

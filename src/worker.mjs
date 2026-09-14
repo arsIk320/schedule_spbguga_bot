@@ -8,6 +8,17 @@ CREATE TABLE IF NOT EXISTS settings (
   paused INTEGER NOT NULL DEFAULT 0,
   schedule TEXT NOT NULL DEFAULT '[]'
 );
+CREATE TABLE IF NOT EXISTS user_settings (
+  chat_id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,
+  timezone TEXT NOT NULL DEFAULT 'Europe/Moscow',
+  lead_minutes INTEGER NOT NULL DEFAULT 15,
+  paused INTEGER NOT NULL DEFAULT 0,
+  schedule TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS user_settings_active ON user_settings(paused, chat_id);
 CREATE TABLE IF NOT EXISTS jobs (
   key TEXT PRIMARY KEY,
   done INTEGER NOT NULL DEFAULT 0,
@@ -28,7 +39,7 @@ export const COMMANDS = [
 ].map(([command, description]) => ({ command, description }));
 
 const IMPORT_EXAMPLE = 'Пн | 09:00 | Математика | Иванов И.И. | 305 | Корпус А, 3 этаж\nВт | 10:40 | Физика | Петрова А.С. | 112 | Главный корпус, 1 этаж';
-const HELP_TEXT = `Я напомню о паре и подскажу, где кабинет.\n\nПришли своё расписание одним сообщением, по строке на пару:\n${IMPORT_EXAMPLE}\n\nПоля: день | начало | предмет | преподаватель | кабинет | расположение. Новая загрузка целиком заменяет старую. Можно прислать файл .txt в UTF-8 до 32 КБ.\n\nРасписание повторяется каждую неделю. Необязательное 7-е поле: каждую, чёт или нечёт (номер календарной недели ISO).\n\n/today — сегодня\n/tomorrow — завтра\n/week — всё расписание\n/remind 10 или /remind 15 — время напоминания\n/settings — настройки\n/timezone Europe/Moscow — часовой пояс\n/pause и /resume — выключить и включить напоминания\n/test — пример сообщения\n/clear confirm — удалить расписание\n\nКаникулы и праздники: /pause. Расположение кабинета беру из твоего текста.`;
+const HELP_TEXT = `Я напомню о паре и подскажу, где кабинет. У каждого пользователя свои расписание и настройки.\n\nПришли своё расписание одним сообщением, по строке на пару:\n${IMPORT_EXAMPLE}\n\nПоля: день | начало | предмет | преподаватель | кабинет | расположение. Новая загрузка целиком заменяет старую. Можно прислать файл .txt в UTF-8 до 32 КБ.\n\nРасписание повторяется каждую неделю. Необязательное 7-е поле: каждую, чёт или нечёт (номер календарной недели ISO).\n\n/today — сегодня\n/tomorrow — завтра\n/week — всё расписание\n/remind 10 или /remind 15 — время напоминания\n/settings — настройки\n/timezone Europe/Moscow — часовой пояс\n/pause и /resume — выключить и включить напоминания\n/test — пример сообщения\n/clear confirm — удалить расписание\n\nКаникулы и праздники: /pause. Расположение кабинета беру из твоего текста.`;
 const WEEKDAY_NAMES = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 const MAX_TEXT_BYTES = 32768;
 
@@ -66,10 +77,63 @@ async function sendText(env, chatId, text) {
   }
 }
 
-async function readSettings(env) {
+const schemaPromises = new WeakMap();
+
+function validTelegramId(value) {
+  return /^[1-9]\d*$/.test(String(value)) ? String(value) : null;
+}
+
+async function ensureUserSchema(env) {
+  let promise = schemaPromises.get(env);
+  if (!promise) {
+    promise = (async () => {
+      // This also upgrades an already-connected singleton deployment before its
+      // first message after the multi-user version is published.
+      await env.DB.batch([
+        env.DB.prepare(`CREATE TABLE IF NOT EXISTS user_settings (
+          chat_id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          timezone TEXT NOT NULL DEFAULT 'Europe/Moscow',
+          lead_minutes INTEGER NOT NULL DEFAULT 15,
+          paused INTEGER NOT NULL DEFAULT 0,
+          schedule TEXT NOT NULL DEFAULT '[]',
+          created_at INTEGER NOT NULL,
+          updated_at INTEGER NOT NULL
+        )`),
+        env.DB.prepare('CREATE INDEX IF NOT EXISTS user_settings_active ON user_settings(paused, chat_id)'),
+      ]);
+    })().catch(error => {
+      schemaPromises.delete(env);
+      throw error;
+    });
+    schemaPromises.set(env, promise);
+  }
+  await promise;
+}
+
+async function migrateLegacySettings(env, chatId) {
+  const ownerId = validTelegramId(env.OWNER_ID);
+  if (!ownerId || String(chatId) !== ownerId) return;
+  const legacy = await env.DB.prepare('SELECT timezone, lead_minutes, paused, schedule FROM settings WHERE id = 1').first();
+  if (!legacy) return;
+  const now = Date.now();
+  await env.DB.prepare(`INSERT OR IGNORE INTO user_settings
+    (chat_id, user_id, timezone, lead_minutes, paused, schedule, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(ownerId, ownerId, legacy.timezone, legacy.lead_minutes, legacy.paused, legacy.schedule, now, now).run();
+}
+
+async function readSettings(env, chatId, userId = chatId) {
+  await ensureUserSchema(env);
   const timezone = validateTimezone(env.DEFAULT_TIMEZONE || 'Europe/Moscow');
-  await env.DB.prepare('INSERT OR IGNORE INTO settings (id, timezone) VALUES (1, ?)').bind(timezone).run();
-  const row = await env.DB.prepare('SELECT * FROM settings WHERE id = 1').first();
+  const normalizedChatId = String(chatId);
+  const normalizedUserId = String(userId);
+  await migrateLegacySettings(env, normalizedChatId);
+  const now = Date.now();
+  await env.DB.prepare(`INSERT OR IGNORE INTO user_settings
+    (chat_id, user_id, timezone, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`)
+    .bind(normalizedChatId, normalizedUserId, timezone, now, now).run();
+  const row = await env.DB.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(normalizedChatId).first();
   return { ...row, lessons: JSON.parse(row.schedule) };
 }
 
@@ -91,23 +155,17 @@ async function releaseJob(env, key, owner) {
   await env.DB.prepare('UPDATE jobs SET lease_until = 0 WHERE key = ? AND lease_owner = ?').bind(key, owner).run();
 }
 
-async function applySetting(env, field, value) {
+async function applySetting(env, chatId, field, value) {
   if (!['timezone', 'lead_minutes', 'paused', 'schedule'].includes(field)) throw new Error('Unknown setting');
   const { key, lease } = env.UPDATE_JOB;
   // Persist the setting and its update receipt together. A retried reply must never
   // reapply an old import or undo a later /resume, /pause, or setting change.
   await env.DB.batch([
-    env.DB.prepare(`UPDATE settings SET ${field} = ? WHERE id = 1
+    env.DB.prepare(`UPDATE user_settings SET ${field} = ?, updated_at = ? WHERE chat_id = ?
       AND EXISTS (SELECT 1 FROM jobs WHERE key = ? AND lease_owner = ? AND applied = 0)`)
-      .bind(value, key, lease),
+      .bind(value, Date.now(), String(chatId), key, lease),
     env.DB.prepare('UPDATE jobs SET applied = 1 WHERE key = ? AND lease_owner = ?').bind(key, lease),
   ]);
-}
-
-function isOwner(env, message) {
-  return /^[1-9]\d*$/.test(String(env.OWNER_ID)) &&
-    String(message.from?.id) === String(env.OWNER_ID) &&
-    String(message.chat.id) === String(env.OWNER_ID);
 }
 
 function plusDays(date, amount) {
@@ -123,8 +181,8 @@ function displayLesson(lesson, showDay = false) {
 
 async function importText(env, chatId, text) {
   const lessons = parseSchedule(text);
-  await applySetting(env, 'schedule', JSON.stringify(lessons));
-  const settings = await readSettings(env);
+  await applySetting(env, chatId, 'schedule', JSON.stringify(lessons));
+  const settings = await readSettings(env, chatId);
   await sendText(env, chatId, `Загрузка обработана. Сейчас в расписании пар: ${settings.lessons.length}.\nВремя: ${settings.timezone}. Напоминание за ${settings.lead_minutes} мин.\n${settings.paused ? '⏸ Напоминания на паузе. Включить: /resume' : '🔔 Напоминания включены.'}\nПроверь расписание: /week`);
 }
 
@@ -162,17 +220,17 @@ async function documentText(env, document) {
 }
 
 async function processMessage(env, message) {
-  const chatId = message.chat.id;
+  const chatId = String(message.chat.id);
+  const userId = String(message.from.id);
   const text = (message.text || '').trim();
   const match = text.match(/^\/([a-z_]+)(?:@[a-zA-Z0-9_]+)?(?:\s+([\s\S]*))?$/i);
   const command = match?.[1].toLowerCase();
   const argument = match?.[2]?.trim() || '';
-  if (command === 'id' || (!isOwner(env, message) && command === 'start')) {
-    await sendText(env, chatId, `Твой Telegram ID: ${message.from.id}\nУкажи его в настройке OWNER_ID у своего бота. Затем отправь /start.`);
+  if (command === 'id') {
+    await sendText(env, chatId, `Твой Telegram ID: ${userId}\nБот поддерживает отдельные расписание и настройки для каждого пользователя. Отправь /start, чтобы начать.`);
     return;
   }
-  if (!isOwner(env, message)) return;
-  const settings = await readSettings(env);
+  const settings = await readSettings(env, chatId, userId);
   if (message.document) {
     await importText(env, chatId, await documentText(env, message.document));
     return;
@@ -189,20 +247,20 @@ async function processMessage(env, message) {
       await sendText(env, chatId, `Часовой пояс: ${settings.timezone}\nНапоминание: за ${settings.lead_minutes} мин.\nПар в расписании: ${settings.lessons.length}\nСостояние: ${settings.paused ? '⏸ пауза' : '🔔 включены'}\n\n/remind 10 или /remind 15\n/timezone Europe/Moscow\n/pause · /resume`); break;
     case 'remind':
       if (!['10', '15'].includes(argument)) { await sendText(env, chatId, 'Выбери: /remind 10 или /remind 15'); break; }
-      await applySetting(env, 'lead_minutes', Number(argument));
+      await applySetting(env, chatId, 'lead_minutes', Number(argument));
       await sendText(env, chatId, `Буду напоминать за ${argument} минут до пары.`); break;
     case 'timezone': {
       if (!argument) { await sendText(env, chatId, `Сейчас: ${settings.timezone}. Изменить: /timezone Europe/Moscow`); break; }
       const timezone = validateTimezone(argument);
-      await applySetting(env, 'timezone', timezone);
+      await applySetting(env, chatId, 'timezone', timezone);
       await sendText(env, chatId, `Часовой пояс: ${timezone}. Время пар теперь считается по нему.`); break;
     }
     case 'pause': case 'resume':
-      await applySetting(env, 'paused', command === 'pause' ? 1 : 0);
+      await applySetting(env, chatId, 'paused', command === 'pause' ? 1 : 0);
       await sendText(env, chatId, command === 'pause' ? '⏸ Напоминания на паузе. Включить: /resume' : '🔔 Напоминания включены.'); break;
     case 'clear':
       if (argument !== 'confirm') { await sendText(env, chatId, 'Для удаления всего расписания отправь /clear confirm'); break; }
-      await applySetting(env, 'schedule', '[]');
+      await applySetting(env, chatId, 'schedule', '[]');
       await sendText(env, chatId, 'Расписание удалено. Пришли новое, когда будет нужно.'); break;
     case 'today': case 'tomorrow': {
       const today = localDateParts(new Date(), settings.timezone).date;
@@ -224,11 +282,8 @@ async function processMessage(env, message) {
 export async function handleUpdate(update, env) {
   const message = update.message;
   if (!Number.isSafeInteger(update.update_id) || !message?.from?.id || message.chat?.type !== 'private') return;
-  // Unauthorized chats can ask only for their own ID. Do not let them fill the database.
-  if (!isOwner(env, message)) {
-    if (/^\/(id|start)(?:@[a-zA-Z0-9_]+)?(?:\s|$)/i.test(message.text || '')) await processMessage(env, message);
-    return;
-  }
+  // Every private chat is an independent account. Group chats are rejected above
+  // so one user's schedule can never be exposed to a group or another user.
   const key = `update:${update.update_id}`;
   const now = Date.now();
   const lease = await claimJob(env, key, now, 7 * 86400000);
@@ -251,7 +306,8 @@ export async function handleUpdate(update, env) {
   } catch (error) {
     // Telegram may retry a webhook: the lease prevents simultaneous processing.
     if (error instanceof TelegramError && error.code === 403) {
-      await env.DB.prepare('UPDATE settings SET paused = 1 WHERE id = 1').run();
+      await env.DB.prepare('UPDATE user_settings SET paused = 1, updated_at = ? WHERE chat_id = ?')
+        .bind(Date.now(), String(message.chat.id)).run();
       await finishJob(env, key, lease);
       return;
     }
@@ -263,32 +319,47 @@ export async function handleUpdate(update, env) {
 export async function runReminders(env, now = new Date()) {
   const started = Date.now();
   const currentTime = () => now.getTime() + Math.max(0, Date.now() - started);
-  if (!/^[1-9]\d*$/.test(String(env.OWNER_ID))) return;
-  const settings = await readSettings(env);
+  await ensureUserSchema(env);
+  // Preserve the old singleton schedule when OWNER_ID is still configured.
+  await migrateLegacySettings(env, validTelegramId(env.OWNER_ID));
   if (now.getUTCMinutes() === 0) await env.DB.prepare('DELETE FROM jobs WHERE expires_at < ?').bind(now.getTime()).run();
-  if (settings.paused) return;
-  const candidates = reminderCandidates(settings.lessons, settings, now);
-  for (const candidate of candidates) {
-    if (candidate.startAt <= currentTime()) continue;
-    const key = `reminder:${env.OWNER_ID}:${candidate.key}`;
-    const lease = await claimJob(env, key, currentTime(), 14 * 86400000);
-    if (!lease) continue;
+  const rows = (await env.DB.prepare('SELECT * FROM user_settings WHERE paused = 0').all()).results || [];
+  for (const row of rows) {
+    let settings;
     try {
-      // Sending earlier reminders can take time. Recheck before each network request.
-      const remaining = candidate.startAt - currentTime();
-      if (remaining <= 0) { await finishJob(env, key, lease); continue; }
-      await sendText(env, env.OWNER_ID, formatReminder({ ...candidate, minutesUntil: Math.ceil(remaining / 60000) }));
-      await finishJob(env, key, lease);
-    } catch (error) {
-      if (error instanceof TelegramError && error.code === 403) {
-        await env.DB.prepare('UPDATE settings SET paused = 1 WHERE id = 1').run();
-        await finishJob(env, key, lease);
-        return;
-      }
-      await releaseJob(env, key, lease);
-      // A later tick retries while the class has not started. Do not log token-bearing URLs.
-      console.error('Reminder delivery failed; will retry before class starts.');
+      settings = { ...row, lessons: JSON.parse(row.schedule) };
+    } catch {
+      console.error('Skipping a user with invalid schedule data.');
+      continue;
     }
+    const candidates = reminderCandidates(settings.lessons, settings, now);
+    let blocked = false;
+    for (const candidate of candidates) {
+      if (candidate.startAt <= currentTime()) continue;
+      const chatId = String(row.chat_id);
+      const key = `reminder:${chatId}:${candidate.key}`;
+      const lease = await claimJob(env, key, currentTime(), 14 * 86400000);
+      if (!lease) continue;
+      try {
+        // Sending earlier reminders can take time. Recheck before each network request.
+        const remaining = candidate.startAt - currentTime();
+        if (remaining <= 0) { await finishJob(env, key, lease); continue; }
+        await sendText(env, chatId, formatReminder({ ...candidate, minutesUntil: Math.ceil(remaining / 60000) }));
+        await finishJob(env, key, lease);
+      } catch (error) {
+        if (error instanceof TelegramError && error.code === 403) {
+          await env.DB.prepare('UPDATE user_settings SET paused = 1, updated_at = ? WHERE chat_id = ?')
+            .bind(Date.now(), chatId).run();
+          await finishJob(env, key, lease);
+          blocked = true;
+          break;
+        }
+        await releaseJob(env, key, lease);
+        // A later tick retries while the class has not started. Do not log token-bearing URLs.
+        console.error('Reminder delivery failed; will retry before class starts.');
+      }
+    }
+    if (blocked) continue;
   }
 }
 
@@ -302,7 +373,7 @@ function secretMatches(actual, expected) {
 const SETUP_PAGE = `<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Подключить бота</title>
 <style>body{font:17px/1.6 system-ui;background:#f4f7fc;color:#17243a;max-width:580px;margin:8vh auto;padding:24px}main{background:white;padding:32px;border-radius:20px}input,button{box-sizing:border-box;font:inherit;width:100%;padding:12px;margin-top:12px;border-radius:9px;border:1px solid #b3bfd1}button{background:#2262ce;color:white;cursor:pointer}pre{white-space:pre-wrap;font:inherit}small{color:#52617a}</style>
 <main><h1>Подключить Telegram-бота</h1><p>Введи WEBHOOK_SECRET, который ты сохранил в секретах Worker. Токен BotFather сюда вводить не нужно.</p>
-<form id="form"><input id="secret" type="password" autocomplete="off" placeholder="WEBHOOK_SECRET" required minlength="32"><button id="connect" type="submit">Подключить</button><button id="status" type="button">Проверить подключение</button></form><pre id="result" aria-live="polite"></pre><small>После подключения открой своего бота: /id → укажи этот ID в OWNER_ID → /start. Проверка каждую минуту включается отдельно в настройках Cron Trigger.</small></main>
+<form id="form"><input id="secret" type="password" autocomplete="off" placeholder="WEBHOOK_SECRET" required minlength="32"><button id="connect" type="submit">Подключить</button><button id="status" type="button">Проверить подключение</button></form><pre id="result" aria-live="polite"></pre><small>После подключения каждый пользователь может открыть бота в личном чате и отправить /start. Расписание и настройки отдельные для каждого пользователя. OWNER_ID нужен только для необязательной миграции старого личного расписания. Проверка каждую минуту включается отдельно в настройках Cron Trigger.</small></main>
 <script>const form=document.getElementById('form'),secret=document.getElementById('secret'),result=document.getElementById('result');async function request(action){result.textContent='Подожди…';try{const r=await fetch('/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({secret:secret.value,action})});const d=await r.json();result.textContent=d.message;}catch{result.textContent='Не удалось подключиться. Попробуй ещё раз.'}}form.addEventListener('submit',e=>{e.preventDefault();request('connect')});document.getElementById('status').addEventListener('click',()=>request('status'));</script></html>`;
 
 function jsonMessage(message, status = 200) {
@@ -330,13 +401,14 @@ export default {
       try {
         if (body.action !== 'status') {
           await env.DB.batch(DB_SCHEMA.split(';').map(sql => sql.trim()).filter(Boolean).map(sql => env.DB.prepare(sql)));
-          await readSettings(env);
+          await ensureUserSchema(env);
+          await migrateLegacySettings(env, validTelegramId(env.OWNER_ID));
           await telegramApi(env, 'setWebhook', { url: `${url.origin}/telegram`, secret_token: env.WEBHOOK_SECRET, allowed_updates: ['message'], max_connections: 1 });
           await telegramApi(env, 'setMyCommands', { commands: COMMANDS });
         }
         const info = await telegramApi(env, 'getWebhookInfo', {});
         const correct = info.url === `${url.origin}/telegram`;
-        return jsonMessage(`${correct ? '✅ Telegram подключён.' : '⚠ Telegram пока не подключён к этому адресу.'}\nОжидают обработки: ${info.pending_update_count || 0}.${info.last_error_date ? '\nTelegram сообщал об ошибке доставки. Если очередь растёт, проверь настройки и подключи заново.' : ''}\nСледующий шаг: /id в боте, затем OWNER_ID в настройках Worker и /start. Cron Trigger должен быть * * * * *.`);
+        return jsonMessage(`${correct ? '✅ Telegram подключён.' : '⚠ Telegram пока не подключён к этому адресу.'}\nОжидают обработки: ${info.pending_update_count || 0}.${info.last_error_date ? '\nTelegram сообщал об ошибке доставки. Если очередь растёт, проверь настройки и подключи заново.' : ''}\nСледующий шаг: отправь /start в личном чате с ботом. Каждый пользователь получит своё расписание и настройки. Cron Trigger должен быть * * * * *.`);
       } catch { return jsonMessage('Ошибка подключения. Проверь токен BotFather, базу D1 и её привязку DB. Секреты в журнал не записываются.', 502); }
     }
     try { await handleUpdate(body, env); return new Response('OK'); }
