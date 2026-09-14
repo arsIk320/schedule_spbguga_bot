@@ -286,7 +286,7 @@ test('пользователь выбирает одну из трёх англ�
   f.clearCalls();
   await handleUpdate(update(3, '/week'), f.env);
   const text = f.messages()[0].payload.text;
-  assert.match(text, /Антипова Е\.Е\./);
+  assert.match(text, /Антонова Е\.Е\./);
   assert.doesNotMatch(text, /Мухтабарова О\.И\./);
   assert.equal((await f.settings()).english_group, '2');
 });
@@ -299,7 +299,7 @@ test('таблица расписания показывает все три а�
   await handleUpdate(update(3, '/table'), f.env);
   const text = f.messages()[0].payload.text;
   assert.match(text, /Мухтабарова О\.И\./);
-  assert.match(text, /Антипова Е\.Е\./);
+  assert.match(text, /Антонова Е\.Е\./);
   assert.match(text, /Яковлева К\.М\./);
 });
 
