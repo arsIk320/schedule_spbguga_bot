@@ -1,0 +1,349 @@
+import { parseSchedule, localDateParts, validateTimezone, lessonsForDate, reminderCandidates, formatReminder, ScheduleInputError } from './schedule.mjs';
+
+export const DB_SCHEMA = `
+CREATE TABLE IF NOT EXISTS settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  timezone TEXT NOT NULL DEFAULT 'Europe/Moscow',
+  lead_minutes INTEGER NOT NULL DEFAULT 15,
+  paused INTEGER NOT NULL DEFAULT 0,
+  schedule TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS jobs (
+  key TEXT PRIMARY KEY,
+  done INTEGER NOT NULL DEFAULT 0,
+  applied INTEGER NOT NULL DEFAULT 0,
+  lease_until INTEGER NOT NULL,
+  lease_owner TEXT NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS jobs_expiry ON jobs(expires_at);
+`;
+
+export const COMMANDS = [
+  ['today', 'Пары сегодня'], ['tomorrow', 'Пары завтра'], ['week', 'Всё расписание'],
+  ['import', 'Загрузить расписание'], ['settings', 'Настройки'], ['remind', 'За 10 или 15 минут'],
+  ['pause', 'Приостановить напоминания'], ['resume', 'Включить напоминания'],
+  ['test', 'Проверить сообщение'], ['timezone', 'Часовой пояс'], ['id', 'Мой Telegram ID'],
+  ['clear', 'Очистить расписание'], ['help', 'Инструкция'], ['start', 'Начать'],
+].map(([command, description]) => ({ command, description }));
+
+const IMPORT_EXAMPLE = 'Пн | 09:00 | Математика | Иванов И.И. | 305 | Корпус А, 3 этаж\nВт | 10:40 | Физика | Петрова А.С. | 112 | Главный корпус, 1 этаж';
+const HELP_TEXT = `Я напомню о паре и подскажу, где кабинет.\n\nПришли своё расписание одним сообщением, по строке на пару:\n${IMPORT_EXAMPLE}\n\nПоля: день | начало | предмет | преподаватель | кабинет | расположение. Новая загрузка целиком заменяет старую. Можно прислать файл .txt в UTF-8 до 32 КБ.\n\nРасписание повторяется каждую неделю. Необязательное 7-е поле: каждую, чёт или нечёт (номер календарной недели ISO).\n\n/today — сегодня\n/tomorrow — завтра\n/week — всё расписание\n/remind 10 или /remind 15 — время напоминания\n/settings — настройки\n/timezone Europe/Moscow — часовой пояс\n/pause и /resume — выключить и включить напоминания\n/test — пример сообщения\n/clear confirm — удалить расписание\n\nКаникулы и праздники: /pause. Расположение кабинета беру из твоего текста.`;
+const WEEKDAY_NAMES = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
+const MAX_TEXT_BYTES = 32768;
+
+export class TelegramError extends Error {
+  constructor(code) { super(`Telegram API error ${code}`); this.code = code; }
+}
+
+export async function telegramApi(env, method, payload) {
+  const transport = env.TELEGRAM_FETCH || fetch;
+  let response;
+  try {
+    response = await transport(`https://api.telegram.org/bot${env.BOT_TOKEN}/${method}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload), signal: AbortSignal.timeout(10000),
+    });
+  } catch { throw new TelegramError('network'); }
+  let data;
+  try { data = await response.json(); } catch { throw new TelegramError(response.status); }
+  if (!response.ok || !data.ok) throw new TelegramError(data.error_code || response.status);
+  return data.result;
+}
+
+async function sendText(env, chatId, text) {
+  // Keep every message below Telegram's 4096-character limit, including long schedules.
+  let remaining = text;
+  while (remaining.length) {
+    let end = Math.min(3500, remaining.length);
+    if (end < remaining.length) {
+      const newline = remaining.lastIndexOf('\n', end);
+      if (newline > 0) end = newline;
+      else if (/[\uD800-\uDBFF]/.test(remaining[end - 1])) end--;
+    }
+    await telegramApi(env, 'sendMessage', { chat_id: chatId, text: remaining.slice(0, end) });
+    remaining = remaining.slice(end).replace(/^\n/, '');
+  }
+}
+
+async function readSettings(env) {
+  const timezone = validateTimezone(env.DEFAULT_TIMEZONE || 'Europe/Moscow');
+  await env.DB.prepare('INSERT OR IGNORE INTO settings (id, timezone) VALUES (1, ?)').bind(timezone).run();
+  const row = await env.DB.prepare('SELECT * FROM settings WHERE id = 1').first();
+  return { ...row, lessons: JSON.parse(row.schedule) };
+}
+
+async function claimJob(env, key, now, lifetime) {
+  const owner = crypto.randomUUID();
+  const row = await env.DB.prepare(`INSERT INTO jobs (key, lease_until, lease_owner, expires_at)
+    VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET
+    lease_until = excluded.lease_until, lease_owner = excluded.lease_owner
+    WHERE jobs.done = 0 AND jobs.lease_until <= ? RETURNING key`)
+    .bind(key, now + 90000, owner, now + lifetime, now).first();
+  return row ? owner : null;
+}
+
+async function finishJob(env, key, owner) {
+  await env.DB.prepare('UPDATE jobs SET done = 1 WHERE key = ? AND lease_owner = ?').bind(key, owner).run();
+}
+
+async function releaseJob(env, key, owner) {
+  await env.DB.prepare('UPDATE jobs SET lease_until = 0 WHERE key = ? AND lease_owner = ?').bind(key, owner).run();
+}
+
+async function applySetting(env, field, value) {
+  if (!['timezone', 'lead_minutes', 'paused', 'schedule'].includes(field)) throw new Error('Unknown setting');
+  const { key, lease } = env.UPDATE_JOB;
+  // Persist the setting and its update receipt together. A retried reply must never
+  // reapply an old import or undo a later /resume, /pause, or setting change.
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE settings SET ${field} = ? WHERE id = 1
+      AND EXISTS (SELECT 1 FROM jobs WHERE key = ? AND lease_owner = ? AND applied = 0)`)
+      .bind(value, key, lease),
+    env.DB.prepare('UPDATE jobs SET applied = 1 WHERE key = ? AND lease_owner = ?').bind(key, lease),
+  ]);
+}
+
+function isOwner(env, message) {
+  return /^[1-9]\d*$/.test(String(env.OWNER_ID)) &&
+    String(message.from?.id) === String(env.OWNER_ID) &&
+    String(message.chat.id) === String(env.OWNER_ID);
+}
+
+function plusDays(date, amount) {
+  const value = new Date(`${date}T12:00:00Z`);
+  value.setUTCDate(value.getUTCDate() + amount);
+  return value.toISOString().slice(0, 10);
+}
+
+function displayLesson(lesson, showDay = false) {
+  const parity = lesson.week === 'odd' ? ' · нечётная неделя ISO' : lesson.week === 'even' ? ' · чётная неделя ISO' : '';
+  return `${showDay ? WEEKDAY_NAMES[lesson.day - 1] + ' ' : ''}${lesson.time} — ${lesson.subject}${parity}\n👨‍🏫 ${lesson.teacher}\n🚪 Кабинет ${lesson.room}\n📍 ${lesson.location}`;
+}
+
+async function importText(env, chatId, text) {
+  const lessons = parseSchedule(text);
+  await applySetting(env, 'schedule', JSON.stringify(lessons));
+  const settings = await readSettings(env);
+  await sendText(env, chatId, `Загрузка обработана. Сейчас в расписании пар: ${settings.lessons.length}.\nВремя: ${settings.timezone}. Напоминание за ${settings.lead_minutes} мин.\n${settings.paused ? '⏸ Напоминания на паузе. Включить: /resume' : '🔔 Напоминания включены.'}\nПроверь расписание: /week`);
+}
+
+async function limitedText(response, limit = MAX_TEXT_BYTES) {
+  if (Number(response.headers.get('content-length') || 0) > limit) throw new ScheduleInputError('Файл или сообщение слишком большое (максимум 32 КБ).');
+  if (!response.body) return '';
+  const reader = response.body.getReader();
+  const chunks = [];
+  let length = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    length += value.length;
+    if (length > limit) { await reader.cancel(); throw new ScheduleInputError('Файл или сообщение слишком большое (максимум 32 КБ).'); }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+  catch { throw new ScheduleInputError('Сохрани текстовый файл в кодировке UTF-8.'); }
+}
+
+async function documentText(env, document) {
+  if (!/\.txt$/i.test(document.file_name || '')) throw new ScheduleInputError('Поддерживается файл .txt в UTF-8 или текст сообщением. Фото, PDF и Excel пока не читаю.');
+  if (document.file_size > MAX_TEXT_BYTES) throw new ScheduleInputError('Файл слишком большой: максимум 32 КБ.');
+  const file = await telegramApi(env, 'getFile', { file_id: document.file_id });
+  if (!/^[a-zA-Z0-9_./-]+$/.test(file.file_path || '')) throw new TelegramError('file');
+  let response;
+  try {
+    response = await (env.TELEGRAM_FETCH || fetch)(`https://api.telegram.org/file/bot${env.BOT_TOKEN}/${file.file_path}`, { signal: AbortSignal.timeout(10000) });
+  } catch { throw new TelegramError('network'); }
+  if (!response.ok) throw new TelegramError(response.status);
+  return limitedText(response);
+}
+
+async function processMessage(env, message) {
+  const chatId = message.chat.id;
+  const text = (message.text || '').trim();
+  const match = text.match(/^\/([a-z_]+)(?:@[a-zA-Z0-9_]+)?(?:\s+([\s\S]*))?$/i);
+  const command = match?.[1].toLowerCase();
+  const argument = match?.[2]?.trim() || '';
+  if (command === 'id' || (!isOwner(env, message) && command === 'start')) {
+    await sendText(env, chatId, `Твой Telegram ID: ${message.from.id}\nУкажи его в настройке OWNER_ID у своего бота. Затем отправь /start.`);
+    return;
+  }
+  if (!isOwner(env, message)) return;
+  const settings = await readSettings(env);
+  if (message.document) {
+    await importText(env, chatId, await documentText(env, message.document));
+    return;
+  }
+  if (!command && text.includes('|')) { await importText(env, chatId, text); return; }
+  switch (command) {
+    case 'start': case 'help':
+      await sendText(env, chatId, HELP_TEXT); break;
+    case 'import':
+      if (argument) await importText(env, chatId, argument);
+      else await sendText(env, chatId, `Пришли расписание одним сообщением или файлом .txt:\n\n${IMPORT_EXAMPLE}\n\nНовая загрузка полностью заменит старое расписание.`);
+      break;
+    case 'settings':
+      await sendText(env, chatId, `Часовой пояс: ${settings.timezone}\nНапоминание: за ${settings.lead_minutes} мин.\nПар в расписании: ${settings.lessons.length}\nСостояние: ${settings.paused ? '⏸ пауза' : '🔔 включены'}\n\n/remind 10 или /remind 15\n/timezone Europe/Moscow\n/pause · /resume`); break;
+    case 'remind':
+      if (!['10', '15'].includes(argument)) { await sendText(env, chatId, 'Выбери: /remind 10 или /remind 15'); break; }
+      await applySetting(env, 'lead_minutes', Number(argument));
+      await sendText(env, chatId, `Буду напоминать за ${argument} минут до пары.`); break;
+    case 'timezone': {
+      if (!argument) { await sendText(env, chatId, `Сейчас: ${settings.timezone}. Изменить: /timezone Europe/Moscow`); break; }
+      const timezone = validateTimezone(argument);
+      await applySetting(env, 'timezone', timezone);
+      await sendText(env, chatId, `Часовой пояс: ${timezone}. Время пар теперь считается по нему.`); break;
+    }
+    case 'pause': case 'resume':
+      await applySetting(env, 'paused', command === 'pause' ? 1 : 0);
+      await sendText(env, chatId, command === 'pause' ? '⏸ Напоминания на паузе. Включить: /resume' : '🔔 Напоминания включены.'); break;
+    case 'clear':
+      if (argument !== 'confirm') { await sendText(env, chatId, 'Для удаления всего расписания отправь /clear confirm'); break; }
+      await applySetting(env, 'schedule', '[]');
+      await sendText(env, chatId, 'Расписание удалено. Пришли новое, когда будет нужно.'); break;
+    case 'today': case 'tomorrow': {
+      const today = localDateParts(new Date(), settings.timezone).date;
+      const date = command === 'tomorrow' ? plusDays(today, 1) : today;
+      const lessons = lessonsForDate(settings.lessons, date);
+      await sendText(env, chatId, `${command === 'today' ? 'Сегодня' : 'Завтра'}, ${date} (${settings.timezone})\n\n${lessons.length ? lessons.map(l => displayLesson(l)).join('\n\n') : 'Пар нет.'}`); break;
+    }
+    case 'week':
+      await sendText(env, chatId, settings.lessons.length
+        ? `Расписание (${settings.timezone})\n\n${[...settings.lessons].sort((a, b) => a.day - b.day || a.time.localeCompare(b.time)).map(l => displayLesson(l, true)).join('\n\n')}`
+        : 'Расписание пока пустое. Загрузить: /import'); break;
+    case 'test':
+      await sendText(env, chatId, '✅ Тест: бот может отправлять тебе сообщения.\n\nПример напоминания:\n⏰ Через 15 минут, в 09:00 — Математика\n👨‍🏫 Иванов И.И.\n🚪 Идёшь в кабинет 305\n📍 Корпус А, 3 этаж, налево от лестницы\n\nЭто пример. Проверить автоматическое напоминание можно, добавив пару на 16 минут позже текущего времени.'); break;
+    default:
+      await sendText(env, chatId, 'Пришли расписание текстом или .txt. Формат и команды: /help');
+  }
+}
+
+export async function handleUpdate(update, env) {
+  const message = update.message;
+  if (!Number.isSafeInteger(update.update_id) || !message?.from?.id || message.chat?.type !== 'private') return;
+  // Unauthorized chats can ask only for their own ID. Do not let them fill the database.
+  if (!isOwner(env, message)) {
+    if (/^\/(id|start)(?:@[a-zA-Z0-9_]+)?(?:\s|$)/i.test(message.text || '')) await processMessage(env, message);
+    return;
+  }
+  const key = `update:${update.update_id}`;
+  const now = Date.now();
+  const lease = await claimJob(env, key, now, 7 * 86400000);
+  if (!lease) {
+    const existing = await env.DB.prepare('SELECT done FROM jobs WHERE key = ?').bind(key).first();
+    if (!existing?.done) throw new Error('Update processing is in progress');
+    return;
+  }
+  try {
+    try {
+      const receipt = await env.DB.prepare('SELECT applied FROM jobs WHERE key = ?').bind(key).first();
+      if (receipt.applied) await sendText(env, message.chat.id, 'Эта команда уже была выполнена. Текущее расписание: /week. Настройки: /settings.');
+      else await processMessage({ ...env, UPDATE_JOB: { key, lease } }, message);
+    }
+    catch (error) {
+      if (error instanceof ScheduleInputError) await sendText(env, message.chat.id, `Не удалось загрузить настройки или расписание: ${error.message}\nСтарые данные сохранены.`);
+      else throw error;
+    }
+    await finishJob(env, key, lease);
+  } catch (error) {
+    // Telegram may retry a webhook: the lease prevents simultaneous processing.
+    if (error instanceof TelegramError && error.code === 403) {
+      await env.DB.prepare('UPDATE settings SET paused = 1 WHERE id = 1').run();
+      await finishJob(env, key, lease);
+      return;
+    }
+    await releaseJob(env, key, lease);
+    throw error;
+  }
+}
+
+export async function runReminders(env, now = new Date()) {
+  const started = Date.now();
+  const currentTime = () => now.getTime() + Math.max(0, Date.now() - started);
+  if (!/^[1-9]\d*$/.test(String(env.OWNER_ID))) return;
+  const settings = await readSettings(env);
+  if (now.getUTCMinutes() === 0) await env.DB.prepare('DELETE FROM jobs WHERE expires_at < ?').bind(now.getTime()).run();
+  if (settings.paused) return;
+  const candidates = reminderCandidates(settings.lessons, settings, now);
+  for (const candidate of candidates) {
+    if (candidate.startAt <= currentTime()) continue;
+    const key = `reminder:${env.OWNER_ID}:${candidate.key}`;
+    const lease = await claimJob(env, key, currentTime(), 14 * 86400000);
+    if (!lease) continue;
+    try {
+      // Sending earlier reminders can take time. Recheck before each network request.
+      const remaining = candidate.startAt - currentTime();
+      if (remaining <= 0) { await finishJob(env, key, lease); continue; }
+      await sendText(env, env.OWNER_ID, formatReminder({ ...candidate, minutesUntil: Math.ceil(remaining / 60000) }));
+      await finishJob(env, key, lease);
+    } catch (error) {
+      if (error instanceof TelegramError && error.code === 403) {
+        await env.DB.prepare('UPDATE settings SET paused = 1 WHERE id = 1').run();
+        await finishJob(env, key, lease);
+        return;
+      }
+      await releaseJob(env, key, lease);
+      // A later tick retries while the class has not started. Do not log token-bearing URLs.
+      console.error('Reminder delivery failed; will retry before class starts.');
+    }
+  }
+}
+
+function secretMatches(actual, expected) {
+  if (!expected || !actual || actual.length !== expected.length) return false;
+  let difference = 0;
+  for (let i = 0; i < actual.length; i++) difference |= actual.charCodeAt(i) ^ expected.charCodeAt(i);
+  return difference === 0;
+}
+
+const SETUP_PAGE = `<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Подключить бота</title>
+<style>body{font:17px/1.6 system-ui;background:#f4f7fc;color:#17243a;max-width:580px;margin:8vh auto;padding:24px}main{background:white;padding:32px;border-radius:20px}input,button{box-sizing:border-box;font:inherit;width:100%;padding:12px;margin-top:12px;border-radius:9px;border:1px solid #b3bfd1}button{background:#2262ce;color:white;cursor:pointer}pre{white-space:pre-wrap;font:inherit}small{color:#52617a}</style>
+<main><h1>Подключить Telegram-бота</h1><p>Введи WEBHOOK_SECRET, который ты сохранил в секретах Worker. Токен BotFather сюда вводить не нужно.</p>
+<form id="form"><input id="secret" type="password" autocomplete="off" placeholder="WEBHOOK_SECRET" required minlength="32"><button id="connect" type="submit">Подключить</button><button id="status" type="button">Проверить подключение</button></form><pre id="result" aria-live="polite"></pre><small>После подключения открой своего бота: /id → укажи этот ID в OWNER_ID → /start. Проверка каждую минуту включается отдельно в настройках Cron Trigger.</small></main>
+<script>const form=document.getElementById('form'),secret=document.getElementById('secret'),result=document.getElementById('result');async function request(action){result.textContent='Подожди…';try{const r=await fetch('/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({secret:secret.value,action})});const d=await r.json();result.textContent=d.message;}catch{result.textContent='Не удалось подключиться. Попробуй ещё раз.'}}form.addEventListener('submit',e=>{e.preventDefault();request('connect')});document.getElementById('status').addEventListener('click',()=>request('status'));</script></html>`;
+
+function jsonMessage(message, status = 200) {
+  return Response.json({ message }, { status, headers: { 'cache-control': 'no-store' } });
+}
+
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (request.method === 'GET' && (url.pathname === '/' || url.pathname === '/health')) {
+      return new Response('Telegram class reminder bot. Setup: /setup', { headers: { 'content-type': 'text/plain; charset=utf-8' } });
+    }
+    if (request.method === 'GET' && url.pathname === '/setup') {
+      return new Response(SETUP_PAGE, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY', 'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" } });
+    }
+    if (request.method !== 'POST' || !['/telegram', '/setup'].includes(url.pathname)) return new Response('Not found', { status: 404 });
+    if (!env.BOT_TOKEN || !env.WEBHOOK_SECRET || !env.DB) return jsonMessage('Добавь BOT_TOKEN, WEBHOOK_SECRET и привязку базы D1 с именем DB.', 503);
+    if (url.pathname === '/telegram' && !secretMatches(request.headers.get('X-Telegram-Bot-Api-Secret-Token'), env.WEBHOOK_SECRET)) return new Response('Forbidden', { status: 403 });
+    let body;
+    try { body = JSON.parse(await limitedText(request)); if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error(); }
+    catch { return jsonMessage('Некорректное или слишком большое сообщение.', 400); }
+    if (url.pathname === '/setup') {
+      if (typeof body.secret !== 'string' || !secretMatches(body.secret, env.WEBHOOK_SECRET)) return jsonMessage('Неверный WEBHOOK_SECRET.', 403);
+      if (!/^[a-zA-Z0-9_-]{32,256}$/.test(env.WEBHOOK_SECRET) || env.WEBHOOK_SECRET.startsWith('REPLACE_')) return jsonMessage('Задай WEBHOOK_SECRET: 32–256 случайных латинских букв, цифр, _ или -.', 400);
+      try {
+        if (body.action !== 'status') {
+          await env.DB.batch(DB_SCHEMA.split(';').map(sql => sql.trim()).filter(Boolean).map(sql => env.DB.prepare(sql)));
+          await readSettings(env);
+          await telegramApi(env, 'setWebhook', { url: `${url.origin}/telegram`, secret_token: env.WEBHOOK_SECRET, allowed_updates: ['message'], max_connections: 1 });
+          await telegramApi(env, 'setMyCommands', { commands: COMMANDS });
+        }
+        const info = await telegramApi(env, 'getWebhookInfo', {});
+        const correct = info.url === `${url.origin}/telegram`;
+        return jsonMessage(`${correct ? '✅ Telegram подключён.' : '⚠ Telegram пока не подключён к этому адресу.'}\nОжидают обработки: ${info.pending_update_count || 0}.${info.last_error_date ? '\nTelegram сообщал об ошибке доставки. Если очередь растёт, проверь настройки и подключи заново.' : ''}\nСледующий шаг: /id в боте, затем OWNER_ID в настройках Worker и /start. Cron Trigger должен быть * * * * *.`);
+      } catch { return jsonMessage('Ошибка подключения. Проверь токен BotFather, базу D1 и её привязку DB. Секреты в журнал не записываются.', 502); }
+    }
+    try { await handleUpdate(body, env); return new Response('OK'); }
+    catch { console.error('Webhook processing failed.'); return new Response('Retry later', { status: 500 }); }
+  },
+  async scheduled(_controller, env) {
+    // Use actual execution time to avoid stale reminders after delayed cron invocations.
+    await runReminders(env, new Date());
+  },
+};

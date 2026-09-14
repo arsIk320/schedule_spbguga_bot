@@ -1,0 +1,15 @@
+{
+  "name": "class-reminder-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Личный Telegram-бот с расписанием пар и напоминаниями",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node --env-file=.env scripts/local.mjs",
+    "test": "node --test",
+    "build": "node scripts/build.mjs",
+    "connect": "node --env-file=.env scripts/connect.mjs",
+    "deploy": "npx wrangler@4 deploy"
+  }
+}

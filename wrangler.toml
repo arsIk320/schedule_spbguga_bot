@@ -1,0 +1,16 @@
+name = "class-reminder-bot"
+main = "src/worker.mjs"
+compatibility_date = "2026-06-01"
+workers_dev = true
+
+[vars]
+OWNER_ID = "0"
+DEFAULT_TIMEZONE = "Europe/Moscow"
+
+[triggers]
+crons = ["* * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "class-reminder-bot"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
