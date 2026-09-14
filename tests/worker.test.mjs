@@ -252,6 +252,57 @@ test('напоминания доставляются каждому польз�
   assert.equal((await f.env.DB.prepare("SELECT COUNT(*) AS count FROM jobs WHERE key LIKE 'reminder:%' AND done = 1").first()).count, 2);
 });
 
+test('утреннее расписание приходит около 07:00 по часовому поясу пользователя один раз в день', async t => {
+  const f = await fixture(t);
+  await importSchedule(f);
+  f.clearCalls();
+  await runReminders(f.env, new Date('2026-09-14T04:00:00.000Z')); // 07:00 Europe/Moscow
+  assert.equal(f.messages().length, 1);
+  assert.match(f.messages()[0].payload.text, /Расписание на сегодня/);
+  assert.match(f.messages()[0].payload.text, /Математика/);
+  await runReminders(f.env, new Date('2026-09-14T04:01:00.000Z'));
+  assert.equal(f.messages().length, 1);
+  assert.equal((await f.env.DB.prepare("SELECT COUNT(*) AS count FROM jobs WHERE key LIKE 'daily:%' AND done = 1").first()).count, 1);
+});
+
+test('форма маршрутов сохраняет подсказку, которая попадает в напоминание', async t => {
+  const f = await fixture(t);
+  const request = body => new Request('https://bot.example/rooms', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  assert.equal((await worker.fetch(request({ secret: 'wrong', action: 'list' }), f.env)).status, 403);
+  const saved = await worker.fetch(request({ secret: f.env.WEBHOOK_SECRET, action: 'save', room: '305', directions: 'Корпус А, 3 этаж, направо' }), f.env);
+  assert.equal(saved.status, 200);
+  assert.match((await saved.json()).message, /сохранён/);
+  await importSchedule(f);
+  await runReminders(f.env, DUE);
+  assert.match(f.messages()[0].payload.text, /Корпус А, 3 этаж, направо/);
+});
+
+test('пользователь выбирает одну из трёх английских групп', async t => {
+  const f = await fixture(t);
+  await handleUpdate(update(1, '/start'), f.env);
+  await handleUpdate(update(2, '/english 2'), f.env);
+  f.clearCalls();
+  await handleUpdate(update(3, '/week'), f.env);
+  const text = f.messages()[0].payload.text;
+  assert.match(text, /Антипова Е\.Е\./);
+  assert.doesNotMatch(text, /Мухтабарова О\.И\./);
+  assert.equal((await f.settings()).english_group, '2');
+});
+
+test('таблица расписания показывает все три английские подгруппы', async t => {
+  const f = await fixture(t);
+  await handleUpdate(update(1, '/start'), f.env);
+  await handleUpdate(update(2, '/english 2'), f.env);
+  f.clearCalls();
+  await handleUpdate(update(3, '/table'), f.env);
+  const text = f.messages()[0].payload.text;
+  assert.match(text, /Мухтабарова О\.И\./);
+  assert.match(text, /Антипова Е\.Е\./);
+  assert.match(text, /Яковлева К\.М\./);
+});
+
 test('импорт .txt читает UTF-8; неверная кодировка и слишком большой файл сохраняют старые данные', async t => {
   const f = await fixture(t);
   const document = { file_id: 'fake-file-id', file_name: 'schedule.txt', file_size: 200 };

@@ -50,7 +50,7 @@ function normalizedField(value, name, maxLength, lineNumber) {
 function lessonIdentity(lesson) {
   return JSON.stringify([
     lesson.day, lesson.time, lesson.subject, lesson.teacher,
-    lesson.room, lesson.location, lesson.week,
+    lesson.room, lesson.location, lesson.week, lesson.english_group || 'all',
   ]);
 }
 
@@ -67,8 +67,8 @@ export function parseSchedule(text) {
       throw new ScheduleInputError(`можно добавить не больше ${MAX_LESSONS} пар.`, lineNumber);
     }
     const columns = line.split("|");
-    if (columns.length !== 6 && columns.length !== 7) {
-      throw new ScheduleInputError("нужны 6 полей через |: день | время | предмет | преподаватель | кабинет | расположение. Седьмое поле — каждую, нечёт или чёт.", lineNumber);
+    if (columns.length < 6 || columns.length > 8) {
+      throw new ScheduleInputError("нужны 6 полей через |: день | время | предмет | преподаватель | кабинет | расположение. Седьмое поле — каждую, нечёт или чёт, восьмое — группа английского 1, 2 или 3.", lineNumber);
     }
     const dayText = normalizedField(columns[0], "день", 20, lineNumber);
     const day = days.get(alias(dayText));
@@ -78,9 +78,17 @@ export function parseSchedule(text) {
     if (!/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(time)) {
       throw new ScheduleInputError("время должно быть в формате ЧЧ:ММ, например 09:00 (от 00:00 до 23:59).", lineNumber);
     }
-    const weekText = columns.length === 7 ? normalizedField(columns[6], "неделя", 30, lineNumber) : "all";
+    const weekText = columns.length >= 7 ? normalizedField(columns[6], "неделя", 30, lineNumber) : "all";
     const week = weeks.get(alias(weekText));
     if (!week) throw new ScheduleInputError("неделя должна быть «каждую», «нечёт» или «чёт». Чётность — по номеру недели ISO.", lineNumber);
+
+    const englishGroupText = columns.length === 8 ? normalizedField(columns[7], "группа английского", 12, lineNumber) : "all";
+    const englishGroupAlias = alias(englishGroupText);
+    const englishGroup = englishGroupAlias === "все" || englishGroupAlias === "all" || englishGroupAlias === "каждую"
+      ? "all" : englishGroupAlias;
+    if (!['all', '1', '2', '3'].includes(englishGroup)) {
+      throw new ScheduleInputError("группа английского должна быть 1, 2, 3 или все.", lineNumber);
+    }
 
     const lesson = {
       day,
@@ -91,6 +99,7 @@ export function parseSchedule(text) {
       location: normalizedField(columns[5], "расположение", 240, lineNumber),
       week,
     };
+    if (columns.length === 8) lesson.english_group = englishGroup;
     const identity = lessonIdentity(lesson);
     if (seen.has(identity)) throw new ScheduleInputError("эта пара уже есть в расписании; удали повтор.", lineNumber);
     seen.add(identity);

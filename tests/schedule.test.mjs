@@ -18,6 +18,12 @@ test("парсер сохраняет поля и принимает пусты�
   assert.deepEqual(parsed.map(x => [x.day, x.week]), [[1, "all"], [2, "odd"], [3, "even"], [7, "all"]]);
 });
 
+test("парсер сохраняет выбранную группу английского в восьмом поле", () => {
+  const parsed = parseSchedule(`${line} | каждую | 2\n${line.replace('Математика', 'Английский')} | нечёт | 3`);
+  assert.deepEqual(parsed.map(x => x.english_group), ['2', '3']);
+  assert.throws(() => parseSchedule(`${line} | каждую | 4`), /группа английского/);
+});
+
 test("ошибки содержат реальный номер строки; пустые, лишние и неверные поля отклоняются", () => {
   for (const invalid of [
     line.replace("09:00", "9:00"), line.replace("09:00", "24:00"),

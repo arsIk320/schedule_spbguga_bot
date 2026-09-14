@@ -1,4 +1,5 @@
 import { parseSchedule, localDateParts, validateTimezone, lessonsForDate, reminderCandidates, formatReminder, ScheduleInputError } from './schedule.mjs';
+import { DEFAULT_GROUP_ID, groupScheduleText } from './group-schedule.mjs';
 
 export const DB_SCHEMA = `
 CREATE TABLE IF NOT EXISTS settings (
@@ -15,10 +16,18 @@ CREATE TABLE IF NOT EXISTS user_settings (
   lead_minutes INTEGER NOT NULL DEFAULT 15,
   paused INTEGER NOT NULL DEFAULT 0,
   schedule TEXT NOT NULL DEFAULT '[]',
+  english_group TEXT NOT NULL DEFAULT '1',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS user_settings_active ON user_settings(paused, chat_id);
+CREATE TABLE IF NOT EXISTS room_routes (
+  room_key TEXT PRIMARY KEY,
+  room TEXT NOT NULL,
+  directions TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS room_routes_room ON room_routes(room);
 CREATE TABLE IF NOT EXISTS jobs (
   key TEXT PRIMARY KEY,
   done INTEGER NOT NULL DEFAULT 0,
@@ -35,11 +44,13 @@ export const COMMANDS = [
   ['import', 'Загрузить расписание'], ['settings', 'Настройки'], ['remind', 'За 10 или 15 минут'],
   ['pause', 'Приостановить напоминания'], ['resume', 'Включить напоминания'],
   ['test', 'Проверить сообщение'], ['timezone', 'Часовой пояс'], ['id', 'Мой Telegram ID'],
-  ['clear', 'Очистить расписание'], ['help', 'Инструкция'], ['start', 'Начать'],
+  ['clear', 'Очистить расписание'], ['group', 'Восстановить расписание группы'],
+  ['english', 'Группа английского'], ['table', 'Кабинеты и преподаватели'],
+  ['help', 'Инструкция'], ['start', 'Начать'],
 ].map(([command, description]) => ({ command, description }));
 
 const IMPORT_EXAMPLE = 'Пн | 09:00 | Математика | Иванов И.И. | 305 | Корпус А, 3 этаж\nВт | 10:40 | Физика | Петрова А.С. | 112 | Главный корпус, 1 этаж';
-const HELP_TEXT = `Я напомню о паре и подскажу, где кабинет. У каждого пользователя свои расписание и настройки.\n\nПришли своё расписание одним сообщением, по строке на пару:\n${IMPORT_EXAMPLE}\n\nПоля: день | начало | предмет | преподаватель | кабинет | расположение. Новая загрузка целиком заменяет старую. Можно прислать файл .txt в UTF-8 до 32 КБ.\n\nРасписание повторяется каждую неделю. Необязательное 7-е поле: каждую, чёт или нечёт (номер календарной недели ISO).\n\n/today — сегодня\n/tomorrow — завтра\n/week — всё расписание\n/remind 10 или /remind 15 — время напоминания\n/settings — настройки\n/timezone Europe/Moscow — часовой пояс\n/pause и /resume — выключить и включить напоминания\n/test — пример сообщения\n/clear confirm — удалить расписание\n\nКаникулы и праздники: /pause. Расположение кабинета беру из твоего текста.`;
+const HELP_TEXT = `Я напомню о паре и подскажу, где кабинет. У каждого пользователя свои расписание и настройки. Для новых пользователей загружен общий шаблон группы ${DEFAULT_GROUP_ID}.\n\nПришли своё расписание одним сообщением, по строке на пару:\n${IMPORT_EXAMPLE}\n\nПоля: день | начало | предмет | преподаватель | кабинет | расположение. Новая загрузка целиком заменяет старую. Можно прислать файл .txt в UTF-8 до 32 КБ.\n\nРасписание повторяется каждую неделю. Необязательное 7-е поле: каждую, чёт или нечёт (номер календарной недели ISO). Для английского можно добавить восьмое поле: группа 1, 2 или 3.\n\n/today — пары сегодня\n/tomorrow — пары завтра\n/week — всё расписание\n/table — таблица «кабинет — преподаватель — предмет»\n/english 1, /english 2 или /english 3 — выбрать группу английского\n/remind 10 или /remind 15 — время напоминания\n/settings — настройки\n/timezone Europe/Moscow — часовой пояс\n/pause и /resume — выключить и включить напоминания\n/test — пример сообщения\n/group — восстановить общий шаблон группы ${DEFAULT_GROUP_ID}\n/clear confirm — удалить только своё расписание\n\nКаждое утро около 07:00 бот присылает расписание на день. Маршруты кабинетов можно заполнить в онлайн-форме по адресу /rooms.`;
 const WEEKDAY_NAMES = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс'];
 const MAX_TEXT_BYTES = 32768;
 
@@ -97,11 +108,25 @@ async function ensureUserSchema(env) {
           lead_minutes INTEGER NOT NULL DEFAULT 15,
           paused INTEGER NOT NULL DEFAULT 0,
           schedule TEXT NOT NULL DEFAULT '[]',
+          english_group TEXT NOT NULL DEFAULT '1',
           created_at INTEGER NOT NULL,
           updated_at INTEGER NOT NULL
         )`),
         env.DB.prepare('CREATE INDEX IF NOT EXISTS user_settings_active ON user_settings(paused, chat_id)'),
+        env.DB.prepare(`CREATE TABLE IF NOT EXISTS room_routes (
+          room_key TEXT PRIMARY KEY,
+          room TEXT NOT NULL,
+          directions TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        )`),
+        env.DB.prepare('CREATE INDEX IF NOT EXISTS room_routes_room ON room_routes(room)'),
       ]);
+      // Existing deployments have user_settings without english_group. D1 does
+      // not support IF NOT EXISTS for ADD COLUMN, so inspect the schema first.
+      const columns = (await env.DB.prepare('PRAGMA table_info(user_settings)').all()).results || [];
+      if (!columns.some(column => column.name === 'english_group')) {
+        await env.DB.prepare("ALTER TABLE user_settings ADD COLUMN english_group TEXT NOT NULL DEFAULT '1'").run();
+      }
     })().catch(error => {
       schemaPromises.delete(env);
       throw error;
@@ -123,6 +148,24 @@ async function migrateLegacySettings(env, chatId) {
     .bind(ownerId, ownerId, legacy.timezone, legacy.lead_minutes, legacy.paused, legacy.schedule, now, now).run();
 }
 
+function configuredGroup(env) {
+  return String(env.DEFAULT_GROUP || DEFAULT_GROUP_ID).trim() || DEFAULT_GROUP_ID;
+}
+
+function defaultScheduleJson(env) {
+  const group = configuredGroup(env);
+  const text = groupScheduleText(group);
+  if (!text) return '[]';
+  try {
+    return JSON.stringify(parseSchedule(text));
+  } catch (error) {
+    // A malformed built-in template must not prevent a new user from starting
+    // the bot. The template is covered by tests and can be repaired separately.
+    console.error(`Invalid built-in schedule template for group ${group}.`, error);
+    return '[]';
+  }
+}
+
 async function readSettings(env, chatId, userId = chatId) {
   await ensureUserSchema(env);
   const timezone = validateTimezone(env.DEFAULT_TIMEZONE || 'Europe/Moscow');
@@ -130,11 +173,11 @@ async function readSettings(env, chatId, userId = chatId) {
   const normalizedUserId = String(userId);
   await migrateLegacySettings(env, normalizedChatId);
   const now = Date.now();
-  await env.DB.prepare(`INSERT OR IGNORE INTO user_settings
-    (chat_id, user_id, timezone, created_at, updated_at) VALUES (?, ?, ?, ?, ?)`)
-    .bind(normalizedChatId, normalizedUserId, timezone, now, now).run();
+  const inserted = await env.DB.prepare(`INSERT OR IGNORE INTO user_settings
+    (chat_id, user_id, timezone, schedule, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`)
+    .bind(normalizedChatId, normalizedUserId, timezone, defaultScheduleJson(env), now, now).run();
   const row = await env.DB.prepare('SELECT * FROM user_settings WHERE chat_id = ?').bind(normalizedChatId).first();
-  return { ...row, lessons: JSON.parse(row.schedule) };
+  return { ...row, lessons: JSON.parse(row.schedule), isNew: Number(inserted?.meta?.changes || 0) > 0 };
 }
 
 async function claimJob(env, key, now, lifetime) {
@@ -156,7 +199,7 @@ async function releaseJob(env, key, owner) {
 }
 
 async function applySetting(env, chatId, field, value) {
-  if (!['timezone', 'lead_minutes', 'paused', 'schedule'].includes(field)) throw new Error('Unknown setting');
+  if (!['timezone', 'lead_minutes', 'paused', 'schedule', 'english_group'].includes(field)) throw new Error('Unknown setting');
   const { key, lease } = env.UPDATE_JOB;
   // Persist the setting and its update receipt together. A retried reply must never
   // reapply an old import or undo a later /resume, /pause, or setting change.
@@ -168,6 +211,57 @@ async function applySetting(env, chatId, field, value) {
   ]);
 }
 
+function roomKey(room) {
+  return String(room ?? '').trim().replace(/\s+/g, ' ').toLocaleLowerCase('ru-RU');
+}
+
+async function readRoomRoutes(env) {
+  await ensureUserSchema(env);
+  const rows = (await env.DB.prepare('SELECT room_key, room, directions FROM room_routes ORDER BY room_key').all()).results || [];
+  return new Map(rows.map(row => [row.room_key, row]));
+}
+
+function withRoomRoutes(lessons, routes) {
+  return lessons.map(lesson => {
+    const route = routes.get(roomKey(lesson.room));
+    return route ? { ...lesson, location: route.directions, room_route: true } : lesson;
+  });
+}
+
+function userLessonsForDate(settings, date, routes = new Map()) {
+  const englishGroup = String(settings.english_group || '1');
+  const lessons = lessonsForDate(settings.lessons, date).filter(lesson =>
+    !lesson.english_group || lesson.english_group === 'all' || englishGroup === 'all' || lesson.english_group === englishGroup,
+  );
+  return withRoomRoutes(lessons, routes);
+}
+
+function userWeeklyLessons(settings, routes = new Map()) {
+  const englishGroup = String(settings.english_group || '1');
+  return withRoomRoutes(settings.lessons.filter(lesson =>
+    !lesson.english_group || lesson.english_group === 'all' || englishGroup === 'all' || lesson.english_group === englishGroup,
+  ), routes);
+}
+
+function roomTableText(lessons) {
+  const seen = new Set();
+  const rows = [];
+  for (const lesson of lessons) {
+    const key = [lesson.room, lesson.teacher, lesson.subject, lesson.english_group || 'all'].join('\u0000');
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const group = lesson.english_group && lesson.english_group !== 'all' ? ` (английский, группа ${lesson.english_group})` : '';
+    rows.push(`🚪 ${lesson.room} — 👨‍🏫 ${lesson.teacher} — 📚 ${lesson.subject}${group}`);
+  }
+  return rows.sort((a, b) => a.localeCompare(b, 'ru')).join('\n');
+}
+
+function dailyScheduleText(settings, date, lessons) {
+  const header = `☀️ Расписание на сегодня\n${date} · ${settings.timezone}`;
+  if (!lessons.length) return `${header}\n\nПар сегодня нет.`;
+  return `${header}\n\n${lessons.map(lesson => displayLesson(lesson)).join('\n\n')}`;
+}
+
 function plusDays(date, amount) {
   const value = new Date(`${date}T12:00:00Z`);
   value.setUTCDate(value.getUTCDate() + amount);
@@ -176,7 +270,8 @@ function plusDays(date, amount) {
 
 function displayLesson(lesson, showDay = false) {
   const parity = lesson.week === 'odd' ? ' · нечётная неделя ISO' : lesson.week === 'even' ? ' · чётная неделя ISO' : '';
-  return `${showDay ? WEEKDAY_NAMES[lesson.day - 1] + ' ' : ''}${lesson.time} — ${lesson.subject}${parity}\n👨‍🏫 ${lesson.teacher}\n🚪 Кабинет ${lesson.room}\n📍 ${lesson.location}`;
+  const group = lesson.english_group && lesson.english_group !== 'all' ? ` · английский, группа ${lesson.english_group}` : '';
+  return `${showDay ? WEEKDAY_NAMES[lesson.day - 1] + ' ' : ''}${lesson.time} — ${lesson.subject}${group}${parity}\n👨‍🏫 ${lesson.teacher}\n🚪 Кабинет ${lesson.room}\n📍 ${lesson.location}`;
 }
 
 async function importText(env, chatId, text) {
@@ -231,6 +326,7 @@ async function processMessage(env, message) {
     return;
   }
   const settings = await readSettings(env, chatId, userId);
+  const roomRoutes = await readRoomRoutes(env);
   if (message.document) {
     await importText(env, chatId, await documentText(env, message.document));
     return;
@@ -238,13 +334,15 @@ async function processMessage(env, message) {
   if (!command && text.includes('|')) { await importText(env, chatId, text); return; }
   switch (command) {
     case 'start': case 'help':
-      await sendText(env, chatId, HELP_TEXT); break;
+      await sendText(env, chatId, `${HELP_TEXT}${command === 'start' && settings.isNew
+        ? `\n\n✅ Шаблон группы ${configuredGroup(env)} загружен. Выбери свою подгруппу английского: /english 1, /english 2 или /english 3.`
+        : ''}`); break;
     case 'import':
       if (argument) await importText(env, chatId, argument);
       else await sendText(env, chatId, `Пришли расписание одним сообщением или файлом .txt:\n\n${IMPORT_EXAMPLE}\n\nНовая загрузка полностью заменит старое расписание.`);
       break;
     case 'settings':
-      await sendText(env, chatId, `Часовой пояс: ${settings.timezone}\nНапоминание: за ${settings.lead_minutes} мин.\nПар в расписании: ${settings.lessons.length}\nСостояние: ${settings.paused ? '⏸ пауза' : '🔔 включены'}\n\n/remind 10 или /remind 15\n/timezone Europe/Moscow\n/pause · /resume`); break;
+      await sendText(env, chatId, `Часовой пояс: ${settings.timezone}\nНапоминание: за ${settings.lead_minutes} мин.\nАнглийский: группа ${settings.english_group === 'all' ? 'все' : settings.english_group}\nПар в расписании: ${settings.lessons.length}\nУтреннее расписание: около 07:00\nСостояние: ${settings.paused ? '⏸ пауза' : '🔔 включены'}\n\n/remind 10 или /remind 15\n/english 1, /english 2 или /english 3\n/timezone Europe/Moscow\n/pause · /resume`); break;
     case 'remind':
       if (!['10', '15'].includes(argument)) { await sendText(env, chatId, 'Выбери: /remind 10 или /remind 15'); break; }
       await applySetting(env, chatId, 'lead_minutes', Number(argument));
@@ -255,6 +353,16 @@ async function processMessage(env, message) {
       await applySetting(env, chatId, 'timezone', timezone);
       await sendText(env, chatId, `Часовой пояс: ${timezone}. Время пар теперь считается по нему.`); break;
     }
+    case 'english': {
+      if (!['1', '2', '3', 'all', 'все'].includes(argument.toLowerCase())) {
+        await sendText(env, chatId, 'Выбери группу английского: /english 1, /english 2 или /english 3. /english all покажет все три группы.');
+        break;
+      }
+      const englishGroup = ['all', 'все'].includes(argument.toLowerCase()) ? 'all' : argument;
+      await applySetting(env, chatId, 'english_group', englishGroup);
+      await sendText(env, chatId, `Выбрана группа английского: ${englishGroup === 'all' ? 'все три' : englishGroup}. Проверь /today или /table.`);
+      break;
+    }
     case 'pause': case 'resume':
       await applySetting(env, chatId, 'paused', command === 'pause' ? 1 : 0);
       await sendText(env, chatId, command === 'pause' ? '⏸ Напоминания на паузе. Включить: /resume' : '🔔 Напоминания включены.'); break;
@@ -262,16 +370,40 @@ async function processMessage(env, message) {
       if (argument !== 'confirm') { await sendText(env, chatId, 'Для удаления всего расписания отправь /clear confirm'); break; }
       await applySetting(env, chatId, 'schedule', '[]');
       await sendText(env, chatId, 'Расписание удалено. Пришли новое, когда будет нужно.'); break;
+    case 'group': {
+      if (argument && argument !== configuredGroup(env)) {
+        await sendText(env, chatId, `Доступен общий шаблон группы ${configuredGroup(env)}. Отправь /group без аргумента.`);
+        break;
+      }
+      const schedule = defaultScheduleJson(env);
+      if (schedule === '[]') {
+        await sendText(env, chatId, `Шаблон группы ${configuredGroup(env)} пока не настроен.`);
+        break;
+      }
+      await applySetting(env, chatId, 'schedule', schedule);
+      await sendText(env, chatId, `Расписание группы ${configuredGroup(env)} восстановлено. Английский: группа ${settings.english_group === 'all' ? 'все' : settings.english_group}. Проверь /table и /today.`);
+      break;
+    }
     case 'today': case 'tomorrow': {
       const today = localDateParts(new Date(), settings.timezone).date;
       const date = command === 'tomorrow' ? plusDays(today, 1) : today;
-      const lessons = lessonsForDate(settings.lessons, date);
+      const lessons = userLessonsForDate(settings, date, roomRoutes);
       await sendText(env, chatId, `${command === 'today' ? 'Сегодня' : 'Завтра'}, ${date} (${settings.timezone})\n\n${lessons.length ? lessons.map(l => displayLesson(l)).join('\n\n') : 'Пар нет.'}`); break;
     }
     case 'week':
-      await sendText(env, chatId, settings.lessons.length
-        ? `Расписание (${settings.timezone})\n\n${[...settings.lessons].sort((a, b) => a.day - b.day || a.time.localeCompare(b.time)).map(l => displayLesson(l, true)).join('\n\n')}`
+      {
+        const lessons = userWeeklyLessons(settings, roomRoutes);
+        await sendText(env, chatId, lessons.length
+        ? `Расписание (${settings.timezone})\n\n${[...lessons].sort((a, b) => a.day - b.day || a.time.localeCompare(b.time)).map(l => displayLesson(l, true)).join('\n\n')}`
         : 'Расписание пока пустое. Загрузить: /import'); break;
+    }
+    case 'table': {
+      // The table is an inspection view: show all three English variants even
+      // when the personal daily schedule is filtered to one selected group.
+      const table = roomTableText(withRoomRoutes(settings.lessons, roomRoutes));
+      await sendText(env, chatId, table ? `Таблица распознанного расписания\n\nКабинет — преподаватель — предмет\n\n${table}\n\nМаршруты кабинетов можно заполнить на странице Worker с окончанием /rooms.` : 'Таблица пока пуста. Загрузить расписание: /import');
+      break;
+    }
     case 'test':
       await sendText(env, chatId, '✅ Тест: бот может отправлять тебе сообщения.\n\nПример напоминания:\n⏰ Через 15 минут, в 09:00 — Математика\n👨‍🏫 Иванов И.И.\n🚪 Идёшь в кабинет 305\n📍 Корпус А, 3 этаж, налево от лестницы\n\nЭто пример. Проверить автоматическое напоминание можно, добавив пару на 16 минут позже текущего времени.'); break;
     default:
@@ -316,6 +448,39 @@ export async function handleUpdate(update, env) {
   }
 }
 
+async function runMorningDigests(env, rows, routes, now) {
+  for (const row of rows) {
+    let settings;
+    try {
+      settings = { ...row, lessons: JSON.parse(row.schedule) };
+    } catch {
+      console.error('Skipping a user with invalid schedule data for morning digest.');
+      continue;
+    }
+    const local = localDateParts(now, settings.timezone);
+    // Cron runs every minute. A short window tolerates a delayed invocation
+    // while the per-day jobs key still guarantees exactly one digest.
+    if (local.hour !== 7 || local.minute > 4) continue;
+    const key = `daily:${row.chat_id}:${local.date}`;
+    const lease = await claimJob(env, key, now.getTime(), 2 * 86400000);
+    if (!lease) continue;
+    try {
+      const lessons = userLessonsForDate(settings, local.date, routes);
+      await sendText(env, String(row.chat_id), dailyScheduleText(settings, local.date, lessons));
+      await finishJob(env, key, lease);
+    } catch (error) {
+      if (error instanceof TelegramError && error.code === 403) {
+        await env.DB.prepare('UPDATE user_settings SET paused = 1, updated_at = ? WHERE chat_id = ?')
+          .bind(Date.now(), String(row.chat_id)).run();
+        await finishJob(env, key, lease);
+      } else {
+        await releaseJob(env, key, lease);
+        console.error('Morning schedule delivery failed; will retry during the 07:00 window.');
+      }
+    }
+  }
+}
+
 export async function runReminders(env, now = new Date()) {
   const started = Date.now();
   const currentTime = () => now.getTime() + Math.max(0, Date.now() - started);
@@ -324,6 +489,8 @@ export async function runReminders(env, now = new Date()) {
   await migrateLegacySettings(env, validTelegramId(env.OWNER_ID));
   if (now.getUTCMinutes() === 0) await env.DB.prepare('DELETE FROM jobs WHERE expires_at < ?').bind(now.getTime()).run();
   const rows = (await env.DB.prepare('SELECT * FROM user_settings WHERE paused = 0').all()).results || [];
+  const roomRoutes = await readRoomRoutes(env);
+  await runMorningDigests(env, rows, roomRoutes, now);
   for (const row of rows) {
     let settings;
     try {
@@ -332,6 +499,7 @@ export async function runReminders(env, now = new Date()) {
       console.error('Skipping a user with invalid schedule data.');
       continue;
     }
+    settings.lessons = userWeeklyLessons(settings, roomRoutes);
     const candidates = reminderCandidates(settings.lessons, settings, now);
     let blocked = false;
     for (const candidate of candidates) {
@@ -376,6 +544,32 @@ const SETUP_PAGE = `<!doctype html><html lang="ru"><meta charset="utf-8"><meta n
 <form id="form"><input id="secret" type="password" autocomplete="off" placeholder="WEBHOOK_SECRET" required minlength="32"><button id="connect" type="submit">Подключить</button><button id="status" type="button">Проверить подключение</button></form><pre id="result" aria-live="polite"></pre><small>После подключения каждый пользователь может открыть бота в личном чате и отправить /start. Расписание и настройки отдельные для каждого пользователя. OWNER_ID нужен только для необязательной миграции старого личного расписания. Проверка каждую минуту включается отдельно в настройках Cron Trigger.</small></main>
 <script>const form=document.getElementById('form'),secret=document.getElementById('secret'),result=document.getElementById('result');async function request(action){result.textContent='Подожди…';try{const r=await fetch('/setup',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({secret:secret.value,action})});const d=await r.json();result.textContent=d.message;}catch{result.textContent='Не удалось подключиться. Попробуй ещё раз.'}}form.addEventListener('submit',e=>{e.preventDefault();request('connect')});document.getElementById('status').addEventListener('click',()=>request('status'));</script></html>`;
 
+const ROOMS_PAGE = `<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Маршруты кабинетов</title>
+<style>body{font:17px/1.55 system-ui;background:#f4f7fc;color:#17243a;max-width:780px;margin:5vh auto;padding:20px}main{background:#fff;padding:28px;border-radius:20px;box-shadow:0 8px 30px #17243a12}input,textarea,button{box-sizing:border-box;font:inherit;width:100%;padding:11px;margin-top:10px;border-radius:9px;border:1px solid #b3bfd1}textarea{min-height:120px;resize:vertical}button{background:#2262ce;color:#fff;cursor:pointer}table{width:100%;border-collapse:collapse;margin-top:20px}th,td{padding:9px;border-bottom:1px solid #d9e0ea;text-align:left;vertical-align:top}small{color:#52617a}#result{white-space:pre-wrap;margin-top:14px}</style>
+<main><h1>Маршруты кабинетов</h1><p>Заполни, как пройти к каждому кабинету. Эти подсказки будут подставляться в утреннее расписание, /today и напоминания.</p>
+<label>WEBHOOK_SECRET<input id="secret" type="password" autocomplete="off" placeholder="Секрет Worker" required></label>
+<form id="route"><label>Кабинет<input id="room" maxlength="80" placeholder="например, 305" required></label><label>Как пройти<textarea id="directions" maxlength="1000" placeholder="Главный корпус, 3 этаж, направо от лестницы"></textarea></label><button type="submit">Сохранить маршрут</button></form>
+<button id="refresh" type="button">Показать сохранённые маршруты</button><div id="result" aria-live="polite"></div><small>Секрет используется только для управления этой формой и не сохраняется в браузере.</small></main>
+<script>const secret=document.getElementById('secret'),room=document.getElementById('room'),directions=document.getElementById('directions'),result=document.getElementById('result');async function api(action,extra={}){result.textContent='Подожди…';try{const r=await fetch('/rooms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({secret:secret.value,action,...extra})});const d=await r.json();result.textContent=d.message||'';if(d.routes){const rows=d.routes.map(x=>'<tr><td></td><td></td></tr>');const table=document.createElement('table');table.innerHTML='<thead><tr><th>Кабинет</th><th>Как пройти</th><th></th></tr></thead><tbody></tbody>';const body=table.querySelector('tbody');d.routes.forEach(x=>{const tr=document.createElement('tr');const r=document.createElement('td');r.textContent=x.room;const v=document.createElement('td');v.textContent=x.directions;const c=document.createElement('td');const b=document.createElement('button');b.textContent='Изменить';b.type='button';b.onclick=()=>{room.value=x.room;directions.value=x.directions;window.scrollTo({top:0,behavior:'smooth'});};c.append(b);tr.append(r,v,c);body.append(tr)});result.append(table)}}catch{result.textContent='Не удалось подключиться. Проверь адрес Worker и секрет.'}}document.getElementById('route').addEventListener('submit',e=>{e.preventDefault();api('save',{room:room.value,directions:directions.value})});document.getElementById('refresh').addEventListener('click',()=>api('list'));</script></html>`;
+
+async function saveRoomRoute(env, room, directions) {
+  const normalizedRoom = String(room || '').trim().replace(/[\u0000-\u001f\u007f]/g, '');
+  const normalizedDirections = String(directions || '').trim().replace(/[\u0000-\u001f\u007f]/g, '');
+  if (!normalizedRoom || normalizedRoom.length > 80) throw new ScheduleInputError('Укажи кабинет длиной от 1 до 80 символов.');
+  if (!normalizedDirections || normalizedDirections.length > 1000) throw new ScheduleInputError('Опиши маршрут длиной от 1 до 1000 символов.');
+  await ensureUserSchema(env);
+  await env.DB.prepare(`INSERT INTO room_routes (room_key, room, directions, updated_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT(room_key) DO UPDATE SET room = excluded.room, directions = excluded.directions, updated_at = excluded.updated_at`)
+    .bind(roomKey(normalizedRoom), normalizedRoom, normalizedDirections, Date.now()).run();
+}
+
+async function roomsResponse(env, body) {
+  if (!['list', 'save'].includes(body.action)) return jsonMessage('Неизвестное действие формы.', 400);
+  if (body.action === 'save') await saveRoomRoute(env, body.room, body.directions);
+  const routes = [...(await readRoomRoutes(env)).values()].map(({ room_key, room, directions }) => ({ room_key, room, directions }));
+  return Response.json({ message: body.action === 'save' ? 'Маршрут сохранён.' : `Сохранённых маршрутов: ${routes.length}.`, routes }, { headers: { 'cache-control': 'no-store' } });
+}
+
 function jsonMessage(message, status = 200) {
   return Response.json({ message }, { status, headers: { 'cache-control': 'no-store' } });
 }
@@ -389,12 +583,26 @@ export default {
     if (request.method === 'GET' && url.pathname === '/setup') {
       return new Response(SETUP_PAGE, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY', 'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" } });
     }
-    if (request.method !== 'POST' || !['/telegram', '/setup'].includes(url.pathname)) return new Response('Not found', { status: 404 });
-    if (!env.BOT_TOKEN || !env.WEBHOOK_SECRET || !env.DB) return jsonMessage('Добавь BOT_TOKEN, WEBHOOK_SECRET и привязку базы D1 с именем DB.', 503);
+    if (request.method === 'GET' && url.pathname === '/rooms') {
+      return new Response(ROOMS_PAGE, { headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-frame-options': 'DENY', 'content-security-policy': "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'" } });
+    }
+    if (request.method !== 'POST' || !['/telegram', '/setup', '/rooms'].includes(url.pathname)) return new Response('Not found', { status: 404 });
+    if (!env.WEBHOOK_SECRET || !env.DB) return jsonMessage('Добавь WEBHOOK_SECRET и привязку базы D1 с именем DB.', 503);
+    if (url.pathname !== '/rooms' && !env.BOT_TOKEN) return jsonMessage('Добавь BOT_TOKEN, WEBHOOK_SECRET и привязку базы D1 с именем DB.', 503);
     if (url.pathname === '/telegram' && !secretMatches(request.headers.get('X-Telegram-Bot-Api-Secret-Token'), env.WEBHOOK_SECRET)) return new Response('Forbidden', { status: 403 });
     let body;
     try { body = JSON.parse(await limitedText(request)); if (!body || typeof body !== 'object' || Array.isArray(body)) throw new Error(); }
     catch { return jsonMessage('Некорректное или слишком большое сообщение.', 400); }
+    if (url.pathname === '/rooms') {
+      if (typeof body.secret !== 'string' || !secretMatches(body.secret, env.WEBHOOK_SECRET)) return jsonMessage('Неверный WEBHOOK_SECRET.', 403);
+      if (!/^[a-zA-Z0-9_-]{32,256}$/.test(env.WEBHOOK_SECRET) || env.WEBHOOK_SECRET.startsWith('REPLACE_')) return jsonMessage('Задай WEBHOOK_SECRET: 32–256 случайных латинских букв, цифр, _ или -.', 400);
+      try { return await roomsResponse(env, body); }
+      catch (error) {
+        if (error instanceof ScheduleInputError) return jsonMessage(error.message, 400);
+        console.error('Room route form failed.');
+        return jsonMessage('Не удалось сохранить маршрут кабинета.', 500);
+      }
+    }
     if (url.pathname === '/setup') {
       if (typeof body.secret !== 'string' || !secretMatches(body.secret, env.WEBHOOK_SECRET)) return jsonMessage('Неверный WEBHOOK_SECRET.', 403);
       if (!/^[a-zA-Z0-9_-]{32,256}$/.test(env.WEBHOOK_SECRET) || env.WEBHOOK_SECRET.startsWith('REPLACE_')) return jsonMessage('Задай WEBHOOK_SECRET: 32–256 случайных латинских букв, цифр, _ или -.', 400);

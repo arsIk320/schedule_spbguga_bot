@@ -12,10 +12,18 @@ CREATE TABLE IF NOT EXISTS user_settings (
   lead_minutes INTEGER NOT NULL DEFAULT 15,
   paused INTEGER NOT NULL DEFAULT 0,
   schedule TEXT NOT NULL DEFAULT '[]',
+  english_group TEXT NOT NULL DEFAULT '1',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS user_settings_active ON user_settings(paused, chat_id);
+CREATE TABLE IF NOT EXISTS room_routes (
+  room_key TEXT PRIMARY KEY,
+  room TEXT NOT NULL,
+  directions TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS room_routes_room ON room_routes(room);
 CREATE TABLE IF NOT EXISTS jobs (
   key TEXT PRIMARY KEY,
   done INTEGER NOT NULL DEFAULT 0,
