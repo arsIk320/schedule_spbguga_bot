@@ -13,4 +13,4 @@ crons = ["* * * * *"]
 [[d1_databases]]
 binding = "DB"
 database_name = "class-reminder-bot"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "344bec92-6eb4-4851-8978-3967b086727b"
