@@ -1,4 +1,4 @@
-name = "class-reminder-bot"
+name = "schedule-spbguga-bot"
 main = "src/worker.mjs"
 compatibility_date = "2026-06-01"
 workers_dev = true

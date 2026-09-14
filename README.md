@@ -27,7 +27,7 @@
 
 ### Создайте приложение и базу
 
-1. В панели Cloudflare откройте **Workers & Pages → Create application**. Создайте Worker через **Start with Hello World**, задайте имя `class-reminder-bot` и нажмите **Deploy**.
+1. В панели Cloudflare откройте **Workers & Pages → Create application**. Создайте Worker через **Start with Hello World**, задайте имя `schedule-spbguga-bot` и нажмите **Deploy**.
 2. Откройте созданный Worker → **Edit code**. Замените содержимое основного файла кодом из `cloudflare-worker.mjs` целиком и нажмите **Deploy**.
 3. В панели откройте **D1 SQL Database** — раздел может находиться внутри **Storage & databases**. Нажмите **Create database**, задайте имя `class-reminder-bot` и создайте базу.
 4. Вернитесь к Worker → **Bindings → Add binding → D1 database**. В поле имени переменной укажите **`DB`**, выберите созданную базу и сохраните.
@@ -57,7 +57,7 @@
 
 ### Подключите Telegram и разрешите доступ себе
 
-7. Найдите адрес Worker вида `https://class-reminder-bot.ВАШ-ПОДДОМЕН.workers.dev`. Откройте его, дописав **`/setup`** в конце.
+7. Найдите адрес Worker вида `https://schedule-spbguga-bot.ВАШ-ПОДДОМЕН.workers.dev`. Откройте его, дописав **`/setup`** в конце.
 8. Введите `WEBHOOK_SECRET`, который сохранили на шаге 5, и нажмите **«Подключить»**. Страница создаст нужные таблицы в базе и подключит Telegram к этому Worker. Через форму также можно проверить состояние подключения.
 9. Откройте **своего нового бота** в Telegram и отправьте `/id`. Он сообщит ваш числовой Telegram ID.
 10. Вернитесь в настройки Worker и замените `OWNER_ID` со значения `0` на полученный ID. Сохраните и нажмите **Deploy**.
@@ -172,7 +172,7 @@ node --env-file=.env scripts/local.mjs --remove-webhook
    npx wrangler@4 d1 create class-reminder-bot
    ```
 
-2. Скопируйте выданный идентификатор базы в `wrangler.toml` вместо `REPLACE_WITH_D1_DATABASE_ID`. Имя binding должно остаться `DB`. Если Wrangler предлагает добавить настройку автоматически, проверьте, что в файле получилась одна запись этой базы, без дубликата.
+2. Скопируйте настоящий UUID базы `class-reminder-bot` в `wrangler.toml` вместо `REPLACE_WITH_D1_DATABASE_ID`. Его можно посмотреть в Cloudflare в **D1 → class-reminder-bot → Database ID** или получить командой `npx wrangler@4 d1 list`. Одного имени базы недостаточно для Workers Builds: `database_id` должен быть реальным UUID. Имя binding должно остаться `DB`, а имя Worker — `schedule-spbguga-bot`.
 3. Выполните публикацию и добавьте секреты. Каждая команда `secret put` запросит значение отдельно:
 
    ```powershell
